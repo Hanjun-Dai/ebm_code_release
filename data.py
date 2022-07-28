@@ -9,7 +9,6 @@ import os
 import numpy as np
 import time
 from scipy.misc import imread, imresize
-from skimage.color import rgb2grey
 from torchvision.datasets import CIFAR10, MNIST, SVHN, CIFAR100, ImageFolder
 from torchvision import transforms
 from imagenet_preprocessing import ImagenetPreprocessor
@@ -215,12 +214,12 @@ class Cifar10(Dataset):
 
         self.full = full
         self.data = CIFAR10(
-            "/root/cifar10",
+            "./data/cifar10",
             transform=transform,
             train=train,
             download=True)
         self.test_data = CIFAR10(
-            "/root/cifar10",
+            "./data/cifar10",
             transform=transform,
             train=False,
             download=True)
