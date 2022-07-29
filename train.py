@@ -21,18 +21,13 @@ from scipy.misc import imsave
 import matplotlib.pyplot as plt
 from hmc import hmc
 
-from mpi4py import MPI
-comm = MPI.COMM_WORLD
-rank = comm.Get_rank()
-
-import horovod.tensorflow as hvd
-hvd.init()
+rank = 0
 
 from inception import get_inception_score
 
-torch.manual_seed(hvd.rank())
-np.random.seed(hvd.rank())
-tf.set_random_seed(hvd.rank())
+torch.manual_seed(0)
+np.random.seed(0)
+tf.set_random_seed(0)
 
 FLAGS = flags.FLAGS
 
@@ -288,13 +283,13 @@ def train(target_vars, saver, sess, logger, dataloader, resume_iter, logdir):
                 for key, value in kvs.items():
                     string += "{}: {}, ".format(key, value)
 
-                if hvd.rank() == 0:
+                if rank == 0:
                     print(string)
                     logger.writekvs(kvs)
             else:
                 _, cur_log_tau, x_mod = sess.run(output, feed_dict)
 
-            if itr % FLAGS.save_interval == 0 and hvd.rank() == 0:
+            if itr % FLAGS.save_interval == 0 and rank == 0:
                 saver.save(
                     sess,
                     osp.join(
@@ -302,7 +297,7 @@ def train(target_vars, saver, sess, logger, dataloader, resume_iter, logdir):
                         FLAGS.exp,
                         'model_{}'.format(itr)))
 
-            if itr % FLAGS.test_interval == 0 and hvd.rank() == 0 and FLAGS.dataset != '2d':
+            if itr % FLAGS.test_interval == 0 and rank == 0 and FLAGS.dataset != '2d':
                 try_im = x_mod
                 orig_im = data_corrupt.squeeze()
                 actual_im = rescale_im(data)
@@ -526,10 +521,10 @@ def test(target_vars, saver, sess, logger, dataloader):
 
 
 def main():
-    print("Local rank: ", hvd.local_rank(), hvd.size())
+    print("Local rank: ", 0, 1)
 
     logdir = osp.join(FLAGS.logdir, FLAGS.exp)
-    if hvd.rank() == 0:
+    if rank == 0:
         if not osp.exists(logdir):
             os.makedirs(logdir)
         logger = TensorBoardOutputFormat(logdir)
@@ -652,7 +647,7 @@ def main():
 
     if FLAGS.dataset == "imagenetfull":
         # In the case of full imagenet, use custom_tensorflow dataloader
-        data_loader = TFImagenetLoader('train', FLAGS.batch_size, hvd.rank(), hvd.size(), rescale=FLAGS.rescale)
+        data_loader = TFImagenetLoader('train', FLAGS.batch_size, 0, 1, rescale=FLAGS.rescale)
     else:
         data_loader = DataLoader(
             dataset,
@@ -678,7 +673,6 @@ def main():
     x_mod_list = []
 
     optimizer = AdamOptimizer(FLAGS.lr, beta1=0.0, beta2=0.999)
-    optimizer = hvd.DistributedOptimizer(optimizer)
 
     for j in range(FLAGS.num_gpus):
 
@@ -938,9 +932,6 @@ def main():
 
     config = tf.ConfigProto()
 
-    if hvd.size() > 1:
-        config.gpu_options.visible_device_list = str(hvd.local_rank())
-
     sess = tf.Session(config=config)
 
     saver = loader = tf.train.Saver(
@@ -960,13 +951,12 @@ def main():
 
     resume_itr = 0
 
-    if (FLAGS.resume_iter != -1 or not FLAGS.train) and hvd.rank() == 0:
+    if (FLAGS.resume_iter != -1 or not FLAGS.train) and rank == 0:
         model_file = osp.join(logdir, 'model_{}'.format(FLAGS.resume_iter))
         resume_itr = FLAGS.resume_iter
         # saver.restore(sess, model_file)
         optimistic_restore(sess, model_file)
 
-    sess.run(hvd.broadcast_global_variables(0))
     print("Initializing variables...")
 
     print("Start broadcast")

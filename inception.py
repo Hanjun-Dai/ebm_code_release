@@ -15,14 +15,12 @@ import scipy.misc
 import math
 import sys
 
-import horovod.tensorflow as hvd
-
 MODEL_DIR = '/tmp/imagenet'
 DATA_URL = 'http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz'
 softmax = None
 
 config = tf.ConfigProto()
-config.gpu_options.visible_device_list = str(hvd.local_rank())
+config.gpu_options.visible_device_list = str(0)
 sess = tf.Session(config=config)
 
 # Call this function with list of images. Each of elements should be a 
