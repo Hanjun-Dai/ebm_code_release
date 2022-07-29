@@ -164,6 +164,8 @@ def train(target_vars, saver, sess, logger, dataloader, resume_iter, logdir):
     X = target_vars['X']
     Y = target_vars['Y']
     X_NOISE = target_vars['X_NOISE']
+    LOG_TAU = target_vars['LOG_TAU']
+    log_tau_stats = target_vars['log_tau_stats']
     train_op = target_vars['train_op']
     energy_pos = target_vars['energy_pos']
     energy_neg = target_vars['energy_neg']
@@ -194,6 +196,7 @@ def train(target_vars, saver, sess, logger, dataloader, resume_iter, logdir):
 
     log_output = [
         train_op,
+        log_tau_stats,
         energy_pos,
         energy_neg,
         eps,
@@ -207,7 +210,7 @@ def train(target_vars, saver, sess, logger, dataloader, resume_iter, logdir):
         x_grad_first,
         label_ent,
         *gvs_dict.keys()]
-    output = [train_op, x_mod]
+    output = [train_op, log_tau_stats, x_mod]
 
     replay_buffer = ReplayBuffer(10000)
     itr = resume_iter
@@ -216,7 +219,7 @@ def train(target_vars, saver, sess, logger, dataloader, resume_iter, logdir):
 
     dataloader_iterator = iter(dataloader)
     best_inception = 0.0
-
+    cur_log_tau = 0.0
     for epoch in range(FLAGS.epoch_num):
         for data_corrupt, data, label in dataloader:
             data_corrupt = data_corrupt_init = data_corrupt.numpy()
@@ -249,17 +252,18 @@ def train(target_vars, saver, sess, logger, dataloader, resume_iter, logdir):
                 if x_mod is not None:
                     data_corrupt = x_mod
 
-            feed_dict = {X_NOISE: data_corrupt, X: data, Y: label}
+            feed_dict = {X_NOISE: data_corrupt, X: data, Y: label, LOG_TAU: cur_log_tau}
 
             if FLAGS.cclass:
                 feed_dict[LABEL] = label
                 feed_dict[LABEL_POS] = label_init
 
             if itr % FLAGS.log_interval == 0:
-                _, e_pos, e_neg, eps, loss_e, loss_ml, loss_total, x_grad, x_off, x_mod, gamma, x_grad_first, label_ent, * \
+                _, cur_log_tau, e_pos, e_neg, eps, loss_e, loss_ml, loss_total, x_grad, x_off, x_mod, gamma, x_grad_first, label_ent, * \
                     grads = sess.run(log_output, feed_dict)
 
                 kvs = {}
+                kvs['log_tau'] = cur_log_tau
                 kvs['e_pos'] = e_pos.mean()
                 kvs['e_pos_std'] = e_pos.std()
                 kvs['e_neg'] = e_neg.mean()
@@ -288,7 +292,7 @@ def train(target_vars, saver, sess, logger, dataloader, resume_iter, logdir):
                     print(string)
                     logger.writekvs(kvs)
             else:
-                _, x_mod = sess.run(output, feed_dict)
+                _, cur_log_tau, x_mod = sess.run(output, feed_dict)
 
             if itr % FLAGS.save_interval == 0 and hvd.rank() == 0:
                 saver.save(
@@ -428,6 +432,7 @@ def test(target_vars, saver, sess, logger, dataloader):
     X_NOISE = target_vars['X_NOISE']
     X = target_vars['X']
     Y = target_vars['Y']
+    LOG_TAU = target_vars['LOG_TAU']
     LABEL = target_vars['LABEL']
     energy_start = target_vars['energy_start']
     x_mod = target_vars['x_mod']
@@ -447,10 +452,10 @@ def test(target_vars, saver, sess, logger, dataloader):
 
     if FLAGS.cclass:
         try_im, energy_orig, energy = sess.run(
-            output, {X_NOISE: orig_im, Y: label[0:1], LABEL: label})
+            output, {X_NOISE: orig_im, Y: label[0:1], LABEL: label, LOG_TAU: 0.0})
     else:
         try_im, energy_orig, energy = sess.run(
-            output, {X_NOISE: orig_im, Y: label[0:1]})
+            output, {X_NOISE: orig_im, Y: label[0:1], LOG_TAU: 0.0})
 
     orig_im = rescale_im(orig_im)
     try_im = rescale_im(try_im)
@@ -730,8 +735,44 @@ def main():
 
         steps = tf.constant(0)
         c = lambda i, x: tf.less(i, FLAGS.num_steps)
+        LOG_TAU = tf.placeholder(shape=(), dtype=tf.float32)
 
-        def langevin_step(counter, x_mod):
+        def get_posterior(y, log_tau):
+            logp = model.forward(y, weights=weights[0], reuse=True)
+            grad_y = tf.gradients(logp, [y])[0]
+            delta = tf.range(256, dtype=tf.float32) / 256.0 - tf.expand_dims(y, -1)
+            grad_y = tf.expand_dims(grad_y, -1)
+            rate_y = delta * grad_y - delta ** 2 / tf.exp(log_tau) / 2
+            log_posterior_y = rate_y / 2.0
+            return logp, log_posterior_y
+
+        def mcmc_step(counter, y, log_tau):
+            logp_current, log_posterior_y = get_posterior(y, log_tau)
+            logits_y = tf.reshape(log_posterior_y, [-1, 256])
+            v_cat = tf.reshape(tf.random.multinomial(logits_y, 1), tf.shape(y))
+            v = tf.cast(v_cat, tf.float32) / 256.0
+            logp_next, log_posterior_v = get_posterior(v, log_tau)
+            y_cat = tf.cast(y * 256.0, tf.int64)
+
+            log_forward = tf.gather(log_posterior_y, v_cat, axis=-1, batch_dims=4)
+            log_forward = tf.reduce_sum(log_forward, axis=[1, 2, 3]) + tf.squeeze(logp_current, axis=1)
+
+            log_backward = tf.gather(log_posterior_v, y_cat, axis=-1, batch_dims=4)
+            log_backward = tf.reduce_sum(log_backward, axis=[1, 2, 3]) + tf.squeeze(logp_next, axis=1)
+            log_acc = log_backward - log_forward
+            acc = tf.clip_by_value(tf.exp(log_acc), 0.0, 1.0)
+
+            accepted = tf.random.uniform(shape=tf.shape(log_acc), maxval=1.0) < acc
+            accepted = tf.cast(tf.reshape(accepted, [-1, 1, 1, 1]), tf.float32)
+            new_y = (1.0 - accepted) * y + accepted * v
+
+            accs = tf.reduce_mean(acc)
+            tau = tf.clip_by_value(tf.exp(log_tau) + 1e-1 * (accs - 0.65) / 1000, 1e-10, 1000000)
+            log_tau = tf.log(tau)
+            counter = counter + 1
+            return counter, new_y, log_tau
+
+        def langevin_step(counter, x_mod, log_tau):
             x_mod = x_mod + tf.random_normal(tf.shape(x_mod),
                                              mean=0.0,
                                              stddev=0.005 * FLAGS.rescale * FLAGS.noise_scale)
@@ -778,9 +819,9 @@ def main():
 
             counter = counter + 1
 
-            return counter, x_mod
+            return counter, x_mod, log_tau
 
-        steps, x_mod = tf.while_loop(c, langevin_step, (steps, x_mod))
+        steps, x_mod, log_tau_stats = tf.while_loop(c, langevin_step, (steps, x_mod, LOG_TAU))
 
         energy_eval = model.forward(x_mod, weights[0], label=LABEL_SPLIT[j],
                                     stop_at_grad=False, reuse=True)
@@ -866,6 +907,8 @@ def main():
             target_vars['weights'] = weights
             target_vars['gvs'] = gvs
 
+        target_vars['LOG_TAU'] = LOG_TAU
+        target_vars['log_tau_stats'] = log_tau_stats
         target_vars['X'] = X
         target_vars['Y'] = Y
         target_vars['LABEL'] = LABEL
