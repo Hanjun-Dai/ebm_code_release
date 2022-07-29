@@ -248,7 +248,6 @@ def train(target_vars, saver, sess, logger, dataloader, resume_iter, logdir):
                     data_corrupt = x_mod
 
             feed_dict = {X_NOISE: data_corrupt, X: data, Y: label, LOG_TAU: cur_log_tau}
-
             if FLAGS.cclass:
                 feed_dict[LABEL] = label
                 feed_dict[LABEL_POS] = label_init
@@ -256,7 +255,6 @@ def train(target_vars, saver, sess, logger, dataloader, resume_iter, logdir):
             if itr % FLAGS.log_interval == 0:
                 _, cur_log_tau, e_pos, e_neg, eps, loss_e, loss_ml, loss_total, x_grad, x_off, x_mod, gamma, x_grad_first, label_ent, * \
                     grads = sess.run(log_output, feed_dict)
-
                 kvs = {}
                 kvs['log_tau'] = cur_log_tau
                 kvs['e_pos'] = e_pos.mean()
@@ -728,7 +726,7 @@ def main():
         eps_begin = tf.zeros(1)
 
         steps = tf.constant(0)
-        c = lambda i, x: tf.less(i, FLAGS.num_steps)
+        c = lambda i, x, t: tf.less(i, FLAGS.num_steps)
         LOG_TAU = tf.placeholder(shape=(), dtype=tf.float32)
 
         def get_posterior(y, log_tau):
@@ -747,12 +745,11 @@ def main():
             v = tf.cast(v_cat, tf.float32) / 256.0
             logp_next, log_posterior_v = get_posterior(v, log_tau)
             y_cat = tf.cast(y * 256.0, tf.int64)
+            log_forward = tf.gather(log_posterior_y, tf.expand_dims(v_cat, -1), batch_dims=4)
+            log_forward = tf.reduce_sum(log_forward, axis=[1, 2, 3, 4]) + tf.squeeze(logp_current, axis=1)
 
-            log_forward = tf.gather(log_posterior_y, v_cat, axis=-1, batch_dims=4)
-            log_forward = tf.reduce_sum(log_forward, axis=[1, 2, 3]) + tf.squeeze(logp_current, axis=1)
-
-            log_backward = tf.gather(log_posterior_v, y_cat, axis=-1, batch_dims=4)
-            log_backward = tf.reduce_sum(log_backward, axis=[1, 2, 3]) + tf.squeeze(logp_next, axis=1)
+            log_backward = tf.gather(log_posterior_v, tf.expand_dims(y_cat, -1), batch_dims=4)
+            log_backward = tf.reduce_sum(log_backward, axis=[1, 2, 3, 4]) + tf.squeeze(logp_next, axis=1)
             log_acc = log_backward - log_forward
             acc = tf.clip_by_value(tf.exp(log_acc), 0.0, 1.0)
 
@@ -815,7 +812,7 @@ def main():
 
             return counter, x_mod, log_tau
 
-        steps, x_mod, log_tau_stats = tf.while_loop(c, langevin_step, (steps, x_mod, LOG_TAU))
+        steps, x_mod, log_tau_stats = tf.while_loop(c, mcmc_step, (steps, x_mod, LOG_TAU))
 
         energy_eval = model.forward(x_mod, weights[0], label=LABEL_SPLIT[j],
                                     stop_at_grad=False, reuse=True)
